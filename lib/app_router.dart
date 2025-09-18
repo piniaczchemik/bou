@@ -1,37 +1,36 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+import 'features/shell/bottom_nav_shell.dart';
+import 'features/training/training_screen.dart';
+import 'features/diet/diet_screen.dart';
+import 'features/social/social_screen.dart';
 
 class AppRouter {
   static GoRouter create() {
     return GoRouter(
       routes: [
-        GoRoute(
-          path: '/',
-          name: 'home',
-          builder: (context, state) => const _HomeScreen(),
-        ),
-      ],
-    );
-  }
-}
-
-class _HomeScreen extends StatelessWidget {
-  const _HomeScreen({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('BOU — Best Of Yourself')),
-      body: const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text('Welcome to BOU'),
-            SizedBox(height: 12),
-            Text('Train • Eat • Compete with Friends'),
+        ShellRoute(
+          builder: (context, state, child) => BottomNavShell(child: child),
+          routes: [
+            GoRoute(path: '/', redirect: (_, __) => '/training'),
+            GoRoute(
+              path: '/training',
+              name: 'training',
+              pageBuilder: (context, state) => const NoTransitionPage(child: TrainingScreen()),
+            ),
+            GoRoute(
+              path: '/diet',
+              name: 'diet',
+              pageBuilder: (context, state) => const NoTransitionPage(child: DietScreen()),
+            ),
+            GoRoute(
+              path: '/social',
+              name: 'social',
+              pageBuilder: (context, state) => const NoTransitionPage(child: SocialScreen()),
+            ),
           ],
         ),
-      ),
+      ],
     );
   }
 }
