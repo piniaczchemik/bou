@@ -21,10 +21,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Flutter
+      - name: Setup Flutter (pin to local version)
         uses: subosito/flutter-action@v2
         with:
-          channel: "stable"
+          channel: stable
+          flutter-version: "3.35.4"
+          cache: true
+
+      - name: Doctor + enable web
+        run: |
+          flutter --version
+          flutter doctor -v
+          flutter config --enable-web
 
       - name: Flutter pub get
         run: flutter pub get
