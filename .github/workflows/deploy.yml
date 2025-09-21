@@ -5,11 +5,25 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+# Allow the workflow's GITHUB_TOKEN to push to the repo
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (full history, no persisted token)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git safe.directory (avoid exit 128 on some runners)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Setup Flutter (pin to your version)
         uses: subosito/flutter-action@v2
@@ -17,16 +31,19 @@ jobs:
           channel: stable
           flutter-version: "3.35.4"
 
-      - name: Enable web & fetch deps
+      - name: Enable web & fetch deps (with retry)
         run: |
           flutter config --enable-web
-          flutter pub get
+          for i in 1 2 3; do flutter pub get && break || (echo "pub get failed, retrying..." && sleep 5); done
 
       - name: Build web (project site base)
         run: |
           flutter build web --release --base-href /bou/
-          # SPA 404 fix so deep links work
+          # SPA 404 fix so deep links work on Pages
           cp build/web/index.html build/web/404.html
+
+      - name: List build output (debug)
+        run: ls -la build/web
 
       - name: Deploy to gh-pages branch
         uses: peaceiris/actions-gh-pages@v3
