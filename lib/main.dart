@@ -1,24 +1,47 @@
-﻿import 'package:flutter/material.dart';
-import 'package:hive_flutter/hive_flutter.dart';
-import 'exercise_tab.dart';
+import 'package:flutter/material.dart';
+import 'core/hive_service.dart';
+import 'features/home/home_demo.dart';
+import 'features/coach/smart_coach.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Hive.initFlutter();
-  await Hive.openBox('prefs');
-  await Hive.openBox('ticks');
-  runApp(const BouApp());
+  await HiveService.init();
+  runApp(const BOUApp());
 }
 
-class BouApp extends StatelessWidget {
-  const BouApp({super.key});
+class BOUApp extends StatefulWidget {
+  const BOUApp({super.key});
+  @override
+  State<BOUApp> createState() => _BOUAppState();
+}
+
+class _BOUAppState extends State<BOUApp> {
+  int index = 0;
 
   @override
   Widget build(BuildContext context) {
+    final pages = [
+      const HomeDemoPage(),
+      const MinimalCoachScreen(), // comes from smart_coach.dart
+    ];
     return MaterialApp(
-      title: 'Bou App',
-      theme: ThemeData(useMaterial3: true),
-      home: const ExerciseTab(),
+      title: 'BOU (Hive + Smart Coach Demo)',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF7C3AED)),
+        useMaterial3: true,
+      ),
+      home: Scaffold(
+        body: pages[index],
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: index,
+          destinations: const [
+            NavigationDestination(icon: Icon(Icons.home), label: 'Home'),
+            NavigationDestination(icon: Icon(Icons.fitness_center), label: 'Workout'),
+          ],
+          onDestinationSelected: (i) => setState(() => index = i),
+        ),
+      ),
+      debugShowCheckedModeBanner: false,
     );
   }
 }

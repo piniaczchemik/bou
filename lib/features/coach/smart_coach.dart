@@ -1,8 +1,6 @@
-// BOU: Smart Coach + Adaptive Nutrition (single-file starter)
-// Drop this into lib/features/coach/smart_coach.dart (or anywhere) and wire the hooks noted below.
-// Assumes Flutter + Dart only (no external deps). Hive/Firestore integration points are marked TODO.
-
+// lib/features/coach/smart_coach.dart
 import 'package:flutter/material.dart';
+import '../../core/hive_service.dart';
 
 // -----------------------------
 // DATA MODELS
@@ -10,7 +8,17 @@ import 'package:flutter/material.dart';
 
 enum EffortTag { easy, solid, grind, nearFailure, failure }
 
-enum TipKind { pushBeyond, dropset, amrap, tempo, restLonger, hydrate, breathe, posture }
+enum TipKind {
+  pushBeyond,
+  dropset,
+  amrap,
+  tempo,
+  restLonger,
+  hydrate,
+  breathe,
+  posture,
+  finishOptions // final set => offer choices
+}
 
 class SetPlan {
   final int targetReps;
@@ -24,8 +32,15 @@ class SetResult {
   final double? actualLoadKg;
   final int rir; // Reps In Reserve (0 = failure)
   final Duration restTaken;
-  final Duration timeUnderTension; // optional estimate
+  final Duration timeUnderTension;
   final EffortTag effort;
+
+  // early stop / incomplete
+  final bool completed; // finished as planned
+  final bool quit; // stopped early (DNF)
+  final int? stoppedAtRep;
+  final String? reason;
+
   const SetResult({
     required this.actualReps,
     this.actualLoadKg,
@@ -33,6 +48,10 @@ class SetResult {
     required this.restTaken,
     required this.timeUnderTension,
     required this.effort,
+    this.completed = true,
+    this.quit = false,
+    this.stoppedAtRep,
+    this.reason,
   });
 }
 
@@ -78,10 +97,10 @@ class SessionState {
 
 class UserProfile {
   final String userId;
-  final int weeklyBonusKcalSoFar; // rolling total for current week
+  final int weeklyBonusKcalSoFar;
   final bool ibs;
   final bool lactoseFree;
-  final int baselineDailyKcal; // from onboarding/TDEE goal
+  final int baselineDailyKcal;
   const UserProfile({
     required this.userId,
     required this.weeklyBonusKcalSoFar,
@@ -91,12 +110,12 @@ class UserProfile {
   });
 
   UserProfile copyWith({int? weeklyBonusKcalSoFar, int? baselineDailyKcal}) => UserProfile(
-    userId: userId,
-    weeklyBonusKcalSoFar: weeklyBonusKcalSoFar ?? this.weeklyBonusKcalSoFar,
-    ibs: ibs,
-    lactoseFree: lactoseFree,
-    baselineDailyKcal: baselineDailyKcal ?? this.baselineDailyKcal,
-  );
+        userId: userId,
+        weeklyBonusKcalSoFar: weeklyBonusKcalSoFar ?? this.weeklyBonusKcalSoFar,
+        ibs: ibs,
+        lactoseFree: lactoseFree,
+        baselineDailyKcal: baselineDailyKcal ?? this.baselineDailyKcal,
+      );
 }
 
 // -----------------------------
@@ -106,20 +125,24 @@ class UserProfile {
 class EffortScore {
   final int score; // 0-100 per session (soft cap 120)
   final int volumeBump; // proxy for work done
-  const EffortScore(this.score, this.volumeBump);
+  final int incompletes;
+  final int quits;
+  const EffortScore(this.score, this.volumeBump, this.incompletes, this.quits);
 }
 
 class Scoring {
-  // Compute a session effort score from set results.
   static EffortScore sessionEffort(SessionState s) {
     int score = 0;
-    int volume = 0; // naive: reps*load; bodyweight ~ load 0.33 * body mass (not tracked here)
+    int volume = 0; // naive: reps*load; bodyweight approximated
+    int incompletes = 0;
+    int quits = 0;
 
     for (final p in s.progress.values) {
       for (int i = 0; i < p.results.length; i++) {
         final r = p.results[i];
         final load = (r.actualLoadKg ?? 0);
         volume += (r.actualReps * (load > 0 ? load : 0.33 * 70 /* assume 70kg */)).round();
+
         switch (r.effort) {
           case EffortTag.easy:
             score += 1;
@@ -137,7 +160,16 @@ class Scoring {
             score += 12;
             break;
         }
-        // Small bonus for beating previous set within same exercise
+
+        if (!r.completed) {
+          incompletes += 1;
+          score -= 4;
+        }
+        if (r.quit) {
+          quits += 1;
+          score -= 10;
+        }
+
         if (i > 0) {
           final prev = p.results[i - 1];
           if (r.actualReps > prev.actualReps || (r.actualLoadKg ?? 0) > (prev.actualLoadKg ?? 0)) {
@@ -146,21 +178,18 @@ class Scoring {
         }
       }
     }
-    // Cap to keep nutrition boosts sane
     score = score.clamp(0, 120);
-    return EffortScore(score, volume);
+    return EffortScore(score, volume, incompletes, quits);
   }
 
-  // Convert effort score to ranking points (gamification)
   static int rankingPoints(EffortScore e) {
-    // Linear with diminishing bump above 80
-    if (e.score <= 80) return e.score; // 1:1 up to 80
-    return 80 + ((e.score - 80) * 0.5).round(); // softer above 80
+    if (e.score <= 80) return e.score;
+    return 80 + ((e.score - 80) * 0.5).round();
   }
 }
 
 // -----------------------------
-// COACH TIP ENGINE (rule-based)
+// COACH TIP ENGINE
 // -----------------------------
 
 class CoachRuleContext {
@@ -181,7 +210,7 @@ class CoachTip {
   final String title;
   final String subtitle;
   final Duration suggestedRest;
-  final void Function()? onAccept; // e.g., convert next set to AMRAP or Dropset
+  final void Function()? onAccept;
   CoachTip({
     required this.kind,
     required this.title,
@@ -192,7 +221,6 @@ class CoachTip {
 }
 
 class CoachEngine {
-  // Main entry: provide a tip between sets
   static CoachTip? nextTip(CoachRuleContext c) {
     if (c.completedSets.isEmpty) {
       return CoachTip(
@@ -205,18 +233,34 @@ class CoachEngine {
 
     final last = c.completedSets.last;
 
-    // 1) Near failure early? Suggest longer rest.
+    if (last.quit) {
+      return CoachTip(
+        kind: TipKind.restLonger,
+        title: "Reset & recover",
+        subtitle: (last.reason ?? "Stopped early") + ". Lower load 10–20% or drop 2 reps next set.",
+        suggestedRest: last.restTaken + const Duration(seconds: 60),
+      );
+    }
+
+    if (!last.completed) {
+      return CoachTip(
+        kind: TipKind.posture,
+        title: "Missed a rep? No stress.",
+        subtitle: "Next set: subtract 1 rep or -2.5kg and nail the form.",
+        suggestedRest: last.restTaken + const Duration(seconds: 20),
+      );
+    }
+
     if (last.rir <= 1 && !c.isFinalSet) {
       return CoachTip(
         kind: TipKind.restLonger,
         title: "Big set — breathe.",
-        subtitle: "You were ~${last.rir} RIR. Take +30–45s and keep form pristine on the next set.",
+        subtitle: "You were ~${last.rir} RIR. Take +30–45s and keep it clean.",
         suggestedRest: last.restTaken + const Duration(seconds: 40),
       );
     }
 
-    // 2) Mid-session push-beyond cue (set 2/3 or 3/4)
-    if ((c.nextSetIndex == 2 || c.nextSetIndex == 3) && last.effort.index >= EffortTag.solid.index) {
+    if (!c.isFinalSet && (c.nextSetIndex == 2 || c.nextSetIndex == 3) && last.effort.index >= EffortTag.solid.index) {
       return CoachTip(
         kind: TipKind.pushBeyond,
         title: "BOU moment: beat your last set.",
@@ -225,67 +269,56 @@ class CoachEngine {
       );
     }
 
-    // 3) Dropset suggestion if isolation + grind/nearFailure and allowed
-    if (c.plan.isIsolation && c.plan.allowDropset && last.effort.index >= EffortTag.grind.index && !c.isFinalSet) {
+    if (!c.isFinalSet && c.plan.isIsolation && c.plan.allowDropset && last.effort.index >= EffortTag.grind.index) {
       return CoachTip(
         kind: TipKind.dropset,
         title: "Optional dropset",
-        subtitle: "Strip ~20% load and hit 8–12 quality reps. Pump > ego.",
+        subtitle: "Strip ~20% load and hit 8–12 quality reps.",
         suggestedRest: const Duration(seconds: 20),
-        onAccept: () {
-          // TODO: mark next set as dropset in your controller/state
-        },
       );
     }
 
-    // 4) Final-set AMRAP if energy remains and allowed
-    if (c.isFinalSet && c.plan.allowAmrapFinal && last.rir >= 2) {
+    if (c.isFinalSet) {
       return CoachTip(
-        kind: TipKind.amrap,
-        title: "Final set: AMRAP",
-        subtitle: "Leave 1–2 RIR. Count clean reps only.",
+        kind: TipKind.finishOptions,
+        title: "Feeling strong?",
+        subtitle: "Bonus set (custom) • Back-off AMRAP • Move to accessory • Or finish.",
         suggestedRest: const Duration(seconds: 30),
-        onAccept: () {
-          // TODO: mark final set as AMRAP in your controller/state
-        },
       );
     }
 
-    // 5) General technique cues fallback
     return CoachTip(
       kind: TipKind.posture,
       title: "Form first",
-      subtitle: "Brace, control the eccentric, drive through full range.",
+      subtitle: "Brace, control the eccentric, full range.",
       suggestedRest: c.plan.sets[c.nextSetIndex.clamp(0, c.plan.sets.length - 1)].rest,
     );
   }
 }
 
 // -----------------------------
-// ADAPTIVE NUTRITION ENGINE
+// ADAPTIVE NUTRITION
 // -----------------------------
 
 class NutritionDecision {
-  final int bonusKcalToday; // apply today (or next day post-PM session)
+  final int bonusKcalToday;
   final int newWeeklyBonusTotal;
   final String rationale;
   const NutritionDecision(this.bonusKcalToday, this.newWeeklyBonusTotal, this.rationale);
 }
 
 class AdaptiveNutrition {
-  // Policy knobs (tune to taste)
-  static const int weeklyBonusCap = 900; // max +900 kcal / week from boosts
-  static const int singleDayCap = 300;   // max +300 kcal on a day
+  static const int weeklyBonusCap = 900;
+  static const int singleDayCap = 300;
 
   static NutritionDecision decide({
     required UserProfile user,
     required EffortScore effort,
     required DateTime now,
   }) {
-    // Map effort score → kcal bonus
     int bonus;
     if (effort.score < 40) {
-      bonus = 0; // recovery focus
+      bonus = 0;
     } else if (effort.score < 60) {
       bonus = 100;
     } else if (effort.score < 80) {
@@ -293,30 +326,126 @@ class AdaptiveNutrition {
     } else if (effort.score < 100) {
       bonus = 200;
     } else {
-      bonus = 250; // monster session
+      bonus = 250;
     }
 
-    // Respect caps
     bonus = bonus.clamp(0, singleDayCap);
     final projectedWeekly = user.weeklyBonusKcalSoFar + bonus;
     if (projectedWeekly > weeklyBonusCap) {
       bonus = (weeklyBonusCap - user.weeklyBonusKcalSoFar).clamp(0, singleDayCap);
     }
 
-    // Optional: Shift to next day if session finished late (post 7pm)
-    final bool shiftToTomorrow = now.hour >= 19;
-
+    final shiftToTomorrow = now.hour >= 19;
     final rationale = shiftToTomorrow
-        ? "High effort day → +${bonus} kcal on tomorrow's plan (late session)."
-        : "High effort day → +${bonus} kcal on today's plan.";
+        ? "High effort → +$bonus kcal on tomorrow (late session)."
+        : "High effort → +$bonus kcal on today.";
 
     return NutritionDecision(bonus, user.weeklyBonusKcalSoFar + bonus, rationale);
   }
 }
 
 // -----------------------------
-// POPUP UI
+// POPUPS (Set outcome, normal tip, finish options, custom set)
 // -----------------------------
+
+class SetOutcomeSheet extends StatefulWidget {
+  final int targetReps;
+  const SetOutcomeSheet({super.key, required this.targetReps});
+
+  @override
+  State<SetOutcomeSheet> createState() => _SetOutcomeSheetState();
+}
+
+class _SetOutcomeSheetState extends State<SetOutcomeSheet> {
+  bool quit = false;
+  int actualReps = 0;
+  int rir = 2;
+  String? reason;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Material(
+          color: Theme.of(context).colorScheme.surface,
+          borderRadius: BorderRadius.circular(16),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text("Log Set Outcome", style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 12),
+                Row(children: [
+                  const Text("Quit early"),
+                  const SizedBox(width: 8),
+                  Switch(value: quit, onChanged: (v) => setState(() => quit = v)),
+                ]),
+                const SizedBox(height: 8),
+                Row(children: [
+                  Text("Reps (target ${widget.targetReps})"),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Slider(
+                      value: actualReps.toDouble(),
+                      min: 0,
+                      max: (widget.targetReps + 5).toDouble(),
+                      divisions: widget.targetReps + 5,
+                      label: "$actualReps",
+                      onChanged: (v) => setState(() => actualReps = v.round()),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 8),
+                Row(children: [
+                  const Text("Reps left in tank (RIR)"),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Slider(
+                      value: rir.toDouble(),
+                      min: 0,
+                      max: 5,
+                      divisions: 5,
+                      label: "$rir",
+                      onChanged: (v) => setState(() => rir = v.round()),
+                    ),
+                  ),
+                ]),
+                TextField(
+                  decoration: const InputDecoration(
+                    labelText: "Reason (optional: pain, time, etc.)",
+                  ),
+                  onChanged: (t) => reason = t,
+                ),
+                const SizedBox(height: 12),
+                Row(children: [
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: () => Navigator.pop(context, {
+                        'quit': quit,
+                        'actualReps': actualReps,
+                        'rir': rir,
+                        'reason': reason,
+                      }),
+                      child: const Text("Save"),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, null),
+                    child: const Text("Cancel"),
+                  ),
+                ])
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
 
 class CoachTipSheet extends StatelessWidget {
   final CoachTip tip;
@@ -340,6 +469,8 @@ class CoachTipSheet extends StatelessWidget {
         return Icons.air;
       case TipKind.posture:
         return Icons.fitness_center;
+      case TipKind.finishOptions:
+        return Icons.add_task;
     }
   }
 
@@ -376,7 +507,7 @@ class CoachTipSheet extends StatelessWidget {
                 const SizedBox(height: 12),
                 Row(
                   children: [
-                    Icon(Icons.timer, size: 18),
+                    const Icon(Icons.timer, size: 18),
                     const SizedBox(width: 6),
                     Text("Suggested rest: ~${tip.suggestedRest.inSeconds}s"),
                   ],
@@ -409,13 +540,269 @@ class CoachTipSheet extends StatelessWidget {
   }
 }
 
+enum FinishChoice { bonusSet, amrapBackoff, moveAccessory, done }
+
+class FinishOptionsSheet extends StatelessWidget {
+  const FinishOptionsSheet({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Material(
+          color: Theme.of(context).colorScheme.surface,
+          borderRadius: BorderRadius.circular(16),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('Feeling strong?', style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 12),
+                ListTile(
+                  leading: const Icon(Icons.add),
+                  title: const Text('Bonus set (customise yourself)'),
+                  subtitle: const Text('Pick your own reps/load and log it.'),
+                  onTap: () => Navigator.pop(context, FinishChoice.bonusSet),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.whatshot),
+                  title: const Text('Back-off AMRAP (~-15% load)'),
+                  subtitle: const Text('As many clean reps as possible, leave 1–2 RIR.'),
+                  onTap: () => Navigator.pop(context, FinishChoice.amrapBackoff),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.swap_horiz),
+                  title: const Text('Move to accessory'),
+                  subtitle: const Text('Continue workout with the next exercise.'),
+                  onTap: () => Navigator.pop(context, FinishChoice.moveAccessory),
+                ),
+                const Divider(),
+                Center(
+                  child: TextButton(
+                    onPressed: () => Navigator.pop(context, FinishChoice.done),
+                    child: const Text('Finish exercise'),
+                  ),
+                )
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// Simple custom-set entry (load, reps, RIR; AMRAP toggle)
+class CustomSetSheet extends StatefulWidget {
+  final double? suggestedLoadKg;
+  final bool amrapDefault;
+  const CustomSetSheet({super.key, this.suggestedLoadKg, this.amrapDefault = false});
+
+  @override
+  State<CustomSetSheet> createState() => _CustomSetSheetState();
+}
+
+class _CustomSetSheetState extends State<CustomSetSheet> {
+  final _loadCtrl = TextEditingController();
+  final _repsCtrl = TextEditingController(text: "8");
+  int rir = 2;
+  bool amrap = false;
+
+  @override
+  void initState() {
+    super.initState();
+    amrap = widget.amrapDefault;
+    if (widget.suggestedLoadKg != null) {
+      _loadCtrl.text = widget.suggestedLoadKg!.toStringAsFixed(1);
+    }
+    if (amrap) _repsCtrl.text = "0"; // AMRAP => reps decided by user effort
+  }
+
+  @override
+  void dispose() {
+    _loadCtrl.dispose();
+    _repsCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Material(
+          color: Theme.of(context).colorScheme.surface,
+          borderRadius: BorderRadius.circular(16),
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text("Custom bonus set", style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 12),
+                Row(children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _loadCtrl,
+                      decoration: const InputDecoration(labelText: "Load (kg) — leave empty for bodyweight"),
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextField(
+                      controller: _repsCtrl,
+                      decoration: const InputDecoration(labelText: "Reps (0 = AMRAP)"),
+                      keyboardType: TextInputType.number,
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 8),
+                Row(children: [
+                  const Text("Reps left in tank (RIR)"),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Slider(
+                      value: rir.toDouble(),
+                      min: 0,
+                      max: 5,
+                      divisions: 5,
+                      label: "$rir",
+                      onChanged: (v) => setState(() => rir = v.round()),
+                    ),
+                  ),
+                ]),
+                Row(
+                  children: [
+                    const Text("AMRAP"),
+                    Switch(
+                      value: amrap,
+                      onChanged: (v) {
+                        setState(() {
+                          amrap = v;
+                          if (amrap) {
+                            _repsCtrl.text = "0";
+                          }
+                        });
+                      },
+                    ),
+                    const SizedBox(width: 8),
+                    const Flexible(child: Text("As many reps as possible; log real reps after.")),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(children: [
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: () {
+                        final load = _loadCtrl.text.trim().isEmpty ? null : double.tryParse(_loadCtrl.text.trim());
+                        final reps = int.tryParse(_repsCtrl.text.trim()) ?? 0;
+                        Navigator.pop(context, {
+                          'loadKg': load,
+                          'reps': reps,
+                          'rir': rir,
+                          'amrap': amrap,
+                        });
+                      },
+                      child: const Text("Add set"),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, null),
+                    child: const Text("Cancel"),
+                  ),
+                ]),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // -----------------------------
-// CONTROLLER WIRES (call these from your Workout screen)
+// CONTROLLER
 // -----------------------------
 
 class SmartCoachController {
-  // TODO inject persistence + ranking services
-  Future<void> onSetCompleted({
+  // Quick form to log outcome (quit/missed reps/RIR)
+  Future<SetResult?> logSetOutcome({
+    required BuildContext context,
+    required SetPlan target,
+    required double? loadKg,
+  }) async {
+    final data = await showModalBottomSheet<Map<String, dynamic>?>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => SetOutcomeSheet(targetReps: target.targetReps),
+    );
+
+    if (data == null) return null;
+
+    final quit = data['quit'] == true;
+    final reps = (data['actualReps'] as int?) ?? 0;
+    final rir = (data['rir'] as int?) ?? 2;
+    final reason = (data['reason'] as String?);
+
+    return SetResult(
+      actualReps: reps,
+      actualLoadKg: loadKg,
+      rir: rir,
+      restTaken: target.rest,
+      timeUnderTension: const Duration(seconds: 0),
+      effort: rir <= 1 ? EffortTag.nearFailure : EffortTag.solid,
+      completed: !quit && reps >= target.targetReps,
+      quit: quit,
+      stoppedAtRep: quit ? reps : (reps < target.targetReps ? reps : null),
+      reason: reason,
+    );
+  }
+
+  // Ask for final-set finish choice; returns the choice if shown
+  Future<FinishChoice?> _showFinishOptions(BuildContext context) async {
+    return await showModalBottomSheet<FinishChoice>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => const FinishOptionsSheet(),
+    );
+  }
+
+  // Custom set prompt (bonus or back-off AMRAP)
+  Future<SetResult?> promptCustomSet(BuildContext context, {double? suggestedLoadKg, bool amrap = false}) async {
+    final data = await showModalBottomSheet<Map<String, dynamic>?>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => CustomSetSheet(suggestedLoadKg: suggestedLoadKg, amrapDefault: amrap),
+    );
+    if (data == null) return null;
+
+    final load = data['loadKg'] as double?;
+    final reps = (data['reps'] as int?) ?? 0;
+    final rir = (data['rir'] as int?) ?? 2;
+
+    return SetResult(
+      actualReps: reps,
+      actualLoadKg: load,
+      rir: rir,
+      restTaken: const Duration(seconds: 90),
+      timeUnderTension: const Duration(seconds: 0),
+      effort: rir <= 1 ? EffortTag.nearFailure : EffortTag.solid,
+      completed: true,
+      quit: false,
+    );
+    // Note: If AMRAP, reps=0 here; you can re-open a quick confirm after the set to log actual reps.
+  }
+
+  /// Show coach tip or final options.
+  /// Returns a FinishChoice when final-set options were shown; otherwise null.
+  Future<FinishChoice?> onSetCompleted({
     required BuildContext context,
     required ExercisePlan plan,
     required List<SetResult> doneSoFar,
@@ -428,107 +815,247 @@ class SmartCoachController {
       isFinalSet: nextSetIndex >= plan.sets.length - 1,
     ));
 
-    if (tip != null && context.mounted) {
-      await showModalBottomSheet<bool>(
-        context: context,
-        isScrollControlled: false,
-        backgroundColor: Colors.transparent,
-        builder: (_) => CoachTipSheet(tip: tip),
-      );
+    if (tip == null || !context.mounted) return null;
+
+    final isFinal = nextSetIndex >= plan.sets.length - 1;
+    if (isFinal && tip.kind == TipKind.finishOptions) {
+      return await _showFinishOptions(context);
     }
+
+    await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => CoachTipSheet(tip: tip),
+    );
+    return null;
   }
 
-  // Call once per session end to update ranking + nutrition
+  // End of session → compute effort, points, and persist kcal boosts
   Future<void> onSessionCompleted({
     required UserProfile user,
     required SessionState session,
   }) async {
     final effort = Scoring.sessionEffort(session);
-
-    // Ranking update (hook into your backend later)
     final points = Scoring.rankingPoints(effort);
-    // TODO: push points to Firestore/Supabase in the future
 
-    // Adaptive nutrition decision
-    final decision = AdaptiveNutrition.decide(user: user, effort: effort, now: DateTime.now());
+    final now = DateTime.now();
+    final decision = AdaptiveNutrition.decide(user: user, effort: effort, now: now);
 
-    // TODO: Persist today's (or tomorrow's) plan bonus kcal into Hive "meal_targets" box
-    // Example pseudo:
-    // final box = await Hive.openBox("meal_targets");
-    // final key = shiftToTomorrow ? tomorrowKey : todayKey;
-    // box.put(key, (box.get(key) ?? baseTarget) + decision.bonusKcalToday);
+    // Persist kcal boosts with Hive
+    await HiveService.addWeeklyBonusKcal(decision.bonusKcalToday, now);
+    await HiveService.addDailyBonusKcal(
+      (now.hour >= 19) ? now.add(const Duration(days: 1)) : now,
+      decision.bonusKcalToday,
+    );
 
-    // TODO: Persist user.weeklyBonusKcalSoFar = decision.newWeeklyBonusTotal
-
-    debugPrint("Session effort=${effort.score}, points=$points, kcal+${decision.bonusKcalToday}");
+    debugPrint(
+        "Session effort=${effort.score}, inc=${effort.incompletes}, quits=${effort.quits}, points=$points, kcal+${decision.bonusKcalToday}");
   }
 }
 
 // -----------------------------
-// MINI DEMO WIDGET (for quick testing)
+// MINIMAL SCREEN (for testing)
 // -----------------------------
 
-class DemoSmartCoachButton extends StatelessWidget {
-  const DemoSmartCoachButton({super.key});
+class MinimalCoachScreen extends StatefulWidget {
+  const MinimalCoachScreen({super.key});
+  @override
+  State<MinimalCoachScreen> createState() => _MinimalCoachScreenState();
+}
+
+class _MinimalCoachScreenState extends State<MinimalCoachScreen> {
+  final controller = SmartCoachController();
+
+  // simple 3-set exercise
+  final plan = ExercisePlan(
+    id: 'incline_db_press',
+    name: 'Incline DB Press',
+    isIsolation: false,
+    sets: const [
+      SetPlan(targetReps: 10, targetLoadKg: 22.5, rest: Duration(seconds: 90)),
+      SetPlan(targetReps: 10, targetLoadKg: 22.5, rest: Duration(seconds: 90)),
+      SetPlan(targetReps: 8, targetLoadKg: 25.0, rest: Duration(seconds: 120)),
+    ],
+  );
+
+  final List<SetResult> doneSoFar = [];
+
+  UserProfile get user => const UserProfile(
+        userId: "demo",
+        weeklyBonusKcalSoFar: 0,
+        ibs: false,
+        lactoseFree: true,
+        baselineDailyKcal: 2600,
+      );
+
+  SessionState get session => SessionState(
+        sessionId: "demo-session",
+        start: DateTime.now(),
+        plan: [plan],
+        progress: {
+          plan.id: ExerciseProgress(exerciseId: plan.id, results: doneSoFar),
+        },
+      );
+
+  int nextSetIndex = 0;
+
+  double? _lastLoad() {
+    if (doneSoFar.isEmpty) return plan.sets.first.targetLoadKg;
+    final loads = doneSoFar.map((r) => r.actualLoadKg).whereType<double>().toList();
+    return loads.isNotEmpty ? loads.last : plan.sets.first.targetLoadKg;
+  }
 
   @override
   Widget build(BuildContext context) {
-    final plan = ExercisePlan(
-      id: "db_incline_dumbbell_press",
-      name: "Incline DB Press",
-      isIsolation: false,
-      sets: const [
-        SetPlan(targetReps: 10, targetLoadKg: 22.5, rest: Duration(seconds: 90)),
-        SetPlan(targetReps: 10, targetLoadKg: 22.5, rest: Duration(seconds: 90)),
-        SetPlan(targetReps: 8, targetLoadKg: 25, rest: Duration(seconds: 120)),
-      ],
-    );
+    return Scaffold(
+      appBar: AppBar(title: const Text('Smart Coach — Minimal')),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            Text('Next set index: $nextSetIndex of ${plan.sets.length}',
+                style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 12),
 
-    final done = <SetResult>[
-      const SetResult(actualReps: 10, actualLoadKg: 22.5, rir: 3, restTaken: Duration(seconds: 95), timeUnderTension: Duration(seconds: 28), effort: EffortTag.solid),
-      const SetResult(actualReps: 10, actualLoadKg: 22.5, rir: 2, restTaken: Duration(seconds: 90), timeUnderTension: Duration(seconds: 30), effort: EffortTag.grind),
-    ];
+            // Log current set
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                onPressed: () async {
+                  if (nextSetIndex >= plan.sets.length) {
+                    // Offer finish options again to add bonus sets if desired
+                    final choice = await controller.onSetCompleted(
+                      context: context,
+                      plan: plan,
+                      doneSoFar: doneSoFar,
+                      nextSetIndex: nextSetIndex, // final
+                    );
 
-    final controller = SmartCoachController();
+                    if (choice == FinishChoice.bonusSet) {
+                      final r = await controller.promptCustomSet(context, suggestedLoadKg: _lastLoad());
+                      if (r != null) {
+                        doneSoFar.add(r);
+                        setState(() {}); // stay at final index
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Bonus set added.')));
+                      }
+                    } else if (choice == FinishChoice.amrapBackoff) {
+                      final base = _lastLoad();
+                      final suggested = (base != null) ? (base * 0.85) : null; // -15%
+                      final r = await controller.promptCustomSet(context, suggestedLoadKg: suggested, amrap: true);
+                      if (r != null) {
+                        doneSoFar.add(r);
+                        setState(() {});
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Back-off AMRAP added.')));
+                      }
+                    }
+                    return;
+                  }
 
-    return ElevatedButton(
-      onPressed: () async {
-        await controller.onSetCompleted(
-          context: context,
-          plan: plan,
-          doneSoFar: done,
-          nextSetIndex: 2,
-        );
-      },
-      child: const Text("Test Smart Coach"),
+                  final r = await controller.logSetOutcome(
+                    context: context,
+                    target: plan.sets[nextSetIndex],
+                    loadKg: plan.sets[nextSetIndex].targetLoadKg,
+                  );
+                  if (r == null) return;
+
+                  doneSoFar.add(r);
+                  setState(() => nextSetIndex += 1);
+
+                  final choice = await controller.onSetCompleted(
+                    context: context,
+                    plan: plan,
+                    doneSoFar: doneSoFar,
+                    nextSetIndex: nextSetIndex,
+                  );
+
+                  // if final-set options were shown and user picked something, handle it
+                  if (choice == FinishChoice.bonusSet) {
+                    final r2 = await controller.promptCustomSet(context, suggestedLoadKg: _lastLoad());
+                    if (r2 != null) {
+                      doneSoFar.add(r2);
+                      setState(() {});
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Bonus set added.')));
+                    }
+                  } else if (choice == FinishChoice.amrapBackoff) {
+                    final base = _lastLoad();
+                    final suggested = (base != null) ? (base * 0.85) : null; // -15%
+                    final r2 = await controller.promptCustomSet(context, suggestedLoadKg: suggested, amrap: true);
+                    if (r2 != null) {
+                      doneSoFar.add(r2);
+                      setState(() {});
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Back-off AMRAP added.')));
+                    }
+                  }
+                },
+                child: const Text('Log current set / Finish options'),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // Force tip (debug)
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton(
+                onPressed: () async {
+                  if (doneSoFar.isEmpty) {
+                    doneSoFar.add(const SetResult(
+                      actualReps: 10,
+                      actualLoadKg: 22.5,
+                      rir: 2,
+                      restTaken: Duration(seconds: 90),
+                      timeUnderTension: Duration(seconds: 30),
+                      effort: EffortTag.grind,
+                    ));
+                    nextSetIndex = 1;
+                  }
+                  await controller.onSetCompleted(
+                    context: context,
+                    plan: plan,
+                    doneSoFar: doneSoFar,
+                    nextSetIndex: nextSetIndex,
+                  );
+                },
+                child: const Text('FORCE TIP (debug)'),
+              ),
+            ),
+
+            const SizedBox(height: 24),
+            Expanded(
+              child: ListView.builder(
+                itemCount: plan.sets.length + (doneSoFar.length > plan.sets.length ? (doneSoFar.length - plan.sets.length) : 0),
+                itemBuilder: (context, i) {
+                  final done = i < doneSoFar.length ? doneSoFar[i] : null;
+                  return ListTile(
+                    leading: Text('Set ${i + 1}'),
+                    title: Text(done == null
+                        ? 'Not logged'
+                        : 'Reps ${done.actualReps}'
+                            '${done.quit ? " (QUIT)" : (!done.completed ? " (incomplete)" : "")}'
+                            '${done.actualLoadKg != null ? " @ ${done.actualLoadKg}kg" : ""}'
+                            ' • RIR ${done.rir}'),
+                  );
+                },
+              ),
+            ),
+
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.tonal(
+                onPressed: () async {
+                  await controller.onSessionCompleted(user: user, session: session);
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text("Session saved. Nutrition adjusted.")),
+                    );
+                  }
+                },
+                child: const Text('Finish Session'),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
-
-// -----------------------------
-// INTEGRATION CHECKLIST
-// -----------------------------
-/*
-1) Where to call onSetCompleted:
-   - After the user logs a set in your Exercise screen, call controller.onSetCompleted(...) to surface a contextual tip.
-
-2) Where to call onSessionCompleted:
-   - When user taps "Finish Session". This computes effort, boosts ranking points (future), and adjusts kcal for today/tomorrow.
-
-3) Hive wires (TODOs):
-   - meal_targets box: store daily kcal target overrides (date -> kcalDelta).
-   - user_profile box: store weeklyBonusKcalSoFar, reset each Monday.
-
-4) UI links:
-   - Home rings should read baselineDailyKcal + (meal_targets[date] ?? 0).
-   - Settings: show a "Weekly BOU Boost: +XYZ kcal" line with reset day.
-
-5) Safeguards:
-   - Respect IBS/lactose flags when suggesting foods; kcal boost should shift macros proportionally to user goal.
-   - Deload week: attenuate effort → kcal mapping by ~50%.
-
-6) Future (Cloud):
-   - Ranking service -> award points from Scoring.rankingPoints(effort).
-   - Leaderboards per weight class.
-   - Store AMRAP PRs per exercise.
-*/
