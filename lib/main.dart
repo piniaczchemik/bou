@@ -1,47 +1,47 @@
 import 'package:flutter/material.dart';
-import 'core/hive_service.dart';
-import 'features/home/home_demo.dart';
-import 'features/coach/smart_coach.dart';
+import 'features/onboarding/onboarding_flow.dart';
+import 'features/programs/program_menu.dart';
+import 'features/programs/program_detail.dart';
 
-Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  await HiveService.init();
-  runApp(const BOUApp());
+void main() {
+  runApp(const BouApp());
 }
 
-class BOUApp extends StatefulWidget {
-  const BOUApp({super.key});
-  @override
-  State<BOUApp> createState() => _BOUAppState();
-}
-
-class _BOUAppState extends State<BOUApp> {
-  int index = 0;
+class BouApp extends StatelessWidget {
+  const BouApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final pages = [
-      const HomeDemoPage(),
-      const MinimalCoachScreen(), // comes from smart_coach.dart
-    ];
     return MaterialApp(
-      title: 'BOU (Hive + Smart Coach Demo)',
+      title: 'BOU',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF7C3AED)),
+        colorSchemeSeed: const Color(0xFF2E7D32), // deep green vibe; tweak later
         useMaterial3: true,
       ),
-      home: Scaffold(
-        body: pages[index],
-        bottomNavigationBar: NavigationBar(
-          selectedIndex: index,
-          destinations: const [
-            NavigationDestination(icon: Icon(Icons.home), label: 'Home'),
-            NavigationDestination(icon: Icon(Icons.fitness_center), label: 'Workout'),
-          ],
-          onDestinationSelected: (i) => setState(() => index = i),
+      routes: {
+        '/': (_) => const _HomeScreen(),
+        '/onboarding': (_) => const OnboardingFlow(),
+        '/programMenu': (_) => const ProgramMenuScreen(),
+        '/programDetail': (_) => const ProgramDetailScreen(),
+      },
+      initialRoute: '/programMenu', // go straight to menu so you can see buttons now
+    );
+  }
+}
+
+class _HomeScreen extends StatelessWidget {
+  const _HomeScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('BOU Home')),
+      body: Center(
+        child: FilledButton(
+          onPressed: () => Navigator.of(context).pushNamed('/programMenu'),
+          child: const Text('Open Program Menu'),
         ),
       ),
-      debugShowCheckedModeBanner: false,
     );
   }
 }
